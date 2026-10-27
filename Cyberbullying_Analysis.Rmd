@@ -1,0 +1,1214 @@
+title: "Cyberbullying Tweet Classification Using Machine Learning" author: "Data Science Project" date: "r Sys.Date()" output: html_document: toc: true toc_depth: 3 number_sections: true theme: readable code_folding: hide
+```{r}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 9,
+  fig.height = 6
+)
+
+set.seed(123)
+```
+
+1. Introduction
+
+This project analyzes cyberbullying tweets using text mining and machine learning. The dataset contains tweets classified into six categories: age, ethnicity, gender, not cyberbullying, other cyberbullying, and religion.
+
+The main objectives are to clean the dataset, explore word frequencies, calculate TF-IDF scores, train Logistic Regression and Support Vector Machine (SVM) classifiers, evaluate their performance, compare the models, and export the results.
+
+2. Install and Load Required Packages
+
+Install the required packages only once. If a package is missing, the following code installs it automatically.
+```{r}
+packages <- c(
+  "dplyr", "stringr", "tidytext", "ggplot2",
+  "caret", "Matrix", "tm", "glmnet",
+  "text2vec", "LiblineaR", "tidyr", "knitr"
+)
+
+missing_packages <- packages[
+  !vapply(packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages, repos = "https://cloud.r-project.org")
+}
+
+invisible(lapply(packages, library, character.only = TRUE))
+```
+
+3. Load the Dataset
+
+Update file_path if the CSV file is stored in another location. Use forward slashes in the Windows path.
+```{r}
+file_path <- "C:/Users/M SANIYA MUNTAZ/Downloads/datascience/cyberbullying_tweets ds.csv"
+
+if (!file.exists(file_path)) {
+  stop("Dataset not found. Please check and update file_path.")
+}
+
+data <- read.csv(
+  file_path,
+  stringsAsFactors = FALSE
+)
+
+required_columns <- c("tweet_text", "cyberbullying_type")
+
+if (!all(required_columns %in% names(data))) {
+  stop("The dataset must contain tweet_text and cyberbullying_type columns.")
+}
+
+cat("Dataset dimensions:", dim(data), "\n")
+
+head(data)
+names(data)
+str(data)
+```
+
+3.1 Category Distribution
+
+The category distribution shows the number of tweets belonging to each cyberbullying class.
+```{r}
+category_counts <- data %>%
+  count(cyberbullying_type, name = "Count")
+
+knitr::kable(category_counts)
+
+ggplot(
+  category_counts,
+  aes(
+    x = reorder(cyberbullying_type, Count),
+    y = Count
+  )
+) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Distribution of Cyberbullying Categories",
+    x = "Category",
+    y = "Number of Tweets"
+  ) +
+  theme_minimal()
+```
+3.2 Missing Values and Duplicates
+```{r}
+colSums(is.na(data))
+
+cat(
+  "Duplicate original tweets:",
+  sum(duplicated(data$tweet_text)),
+  "\n"
+)
+
+table(data$cyberbullying_type, useNA = "ifany")
+```
+
+4. Data Cleaning
+4.1 Remove Missing, Empty, and Duplicate Tweets
+
+The original dataset remains unchanged. A separate object, clean_data, is created for cleaning.
+```{r}
+clean_data <- data %>%
+  filter(
+    !is.na(tweet_text),
+    !is.na(cyberbullying_type)
+  ) %>%
+  mutate(
+    tweet_text = as.character(tweet_text),
+    cyberbullying_type = as.character(cyberbullying_type)
+  ) %>%
+  filter(trimws(tweet_text) != "") %>%
+  distinct(tweet_text, .keep_all = TRUE)
+
+cat("Cleaned dataset dimensions:", dim(clean_data), "\n")
+
+cat(
+  "Remaining duplicate original tweets:",
+  sum(duplicated(clean_data$tweet_text)),
+  "\n"
+)
+
+table(clean_data$cyberbullying_type)
+```
+
+4.2 Create Binary Category Columns
+
+Each category receives a separate binary column. A value of 1 means that the tweet belongs to that category; otherwise, the value is 0.
+```{r}
+categories <- c(
+  "age",
+  "ethnicity",
+  "gender",
+  "not_cyberbullying",
+  "other_cyberbullying",
+  "religion"
+)
+
+unexpected_categories <- setdiff(
+  unique(clean_data$cyberbullying_type),
+  categories
+)
+
+if (length(unexpected_categories) > 0) {
+  stop(
+    "Unexpected category labels: ",
+    paste(unexpected_categories, collapse = ", ")
+  )
+}
+
+for (category in categories) {
+  clean_data[[category]] <- as.integer(
+    clean_data$cyberbullying_type == category
+  )
+}
+
+dim(clean_data)
+names(clean_data)
+head(clean_data)
+```
+
+4.3 Text Preprocessing
+
+Text preprocessing converts tweets to lowercase, removes URLs and usernames, replaces punctuation and numbers with spaces, and removes extra whitespace.
+```{r}
+clean_data <- clean_data %>%
+  mutate(
+    tweet_clean = str_to_lower(tweet_text),
+    tweet_clean = str_remove_all(
+      tweet_clean,
+      "https?://\\S+|www\\.\\S+"
+    ),
+    tweet_clean = str_remove_all(
+      tweet_clean,
+      "@\\w+"
+    ),
+    tweet_clean = str_replace_all(
+      tweet_clean,
+      "[^a-z\\s]",
+      " "
+    ),
+    tweet_clean = str_squish(tweet_clean)
+  ) %>%
+  filter(
+    !is.na(tweet_clean),
+    tweet_clean != ""
+  ) %>%
+  distinct(tweet_clean, .keep_all = TRUE) %>%
+  mutate(tweet_id = row_number())
+
+head(clean_data[, c("tweet_text", "tweet_clean")], 10)
+
+cat("Final cleaned dimensions:", dim(clean_data), "\n")
+
+cat(
+  "Missing cleaned tweets:",
+  sum(is.na(clean_data$tweet_clean)),
+  "\n"
+)
+
+cat(
+  "Empty cleaned tweets:",
+  sum(clean_data$tweet_clean == ""),
+  "\n"
+)
+```
+5. Exploratory Data Analysis
+5.1 Shuffle the Dataset
+
+Shuffling randomizes row order without changing the tweet labels.
+```{r}
+set.seed(123)
+
+clean_data <- clean_data[
+  sample(seq_len(nrow(clean_data))),
+  ,
+  drop = FALSE
+]
+
+rownames(clean_data) <- NULL
+
+head(clean_data, 10)
+table(clean_data$cyberbullying_type)
+dim(clean_data)
+```
+5.2 Tokenize Tweets
+
+Tokenization splits each tweet into individual words.
+```{r}
+tokens <- clean_data %>%
+  select(tweet_id, cyberbullying_type, tweet_clean) %>%
+  tidytext::unnest_tokens(word, tweet_clean)
+
+head(tokens, 20)
+
+cat("Total word tokens:", nrow(tokens), "\n")
+```
+5.3 Remove Stop Words
+
+Stop words are common words such as "the", "is", and "and". Removing them helps highlight more informative words.
+
+data("stop_words", package = "tidytext")
+
+tokens_clean <- tokens %>%
+  anti_join(stop_words, by = "word") %>%
+  filter(
+    nchar(word) >= 3,
+    !grepl("^https?$", word)
+  )
+
+head(tokens_clean, 20)
+
+cat("Tokens after stop-word removal:", nrow(tokens_clean), "\n")
+
+5.4 Most Frequent Words
+word_frequency <- tokens_clean %>%
+  count(word, sort = TRUE)
+
+top_words <- word_frequency %>%
+  slice_max(
+    order_by = n,
+    n = 20,
+    with_ties = FALSE
+  )
+
+knitr::kable(top_words)
+
+ggplot(
+  top_words,
+  aes(x = reorder(word, n), y = n)
+) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Top 20 Most Frequent Words in Cyberbullying Tweets",
+    x = "Word",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+
+5.5 Most Frequent Words by Category
+category_word_frequency <- tokens_clean %>%
+  count(cyberbullying_type, word, sort = TRUE)
+
+top_words_by_category <- category_word_frequency %>%
+  group_by(cyberbullying_type) %>%
+  slice_max(
+    order_by = n,
+    n = 10,
+    with_ties = FALSE
+  ) %>%
+  ungroup()
+
+knitr::kable(top_words_by_category)
+
+ggplot(
+  top_words_by_category,
+  aes(
+    x = tidytext::reorder_within(
+      word, n, cyberbullying_type
+    ),
+    y = n,
+    fill = cyberbullying_type
+  )
+) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ cyberbullying_type, scales = "free") +
+  tidytext::scale_x_reordered() +
+  coord_flip() +
+  labs(
+    title = "Top 10 Words in Each Cyberbullying Category",
+    x = "Word",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+
+6. TF-IDF Analysis
+
+Term Frequency–Inverse Document Frequency (TF-IDF) gives higher weights to words that are frequent in a document but less common across other documents.
+
+6.1 TF-IDF for Individual Tweets
+tfidf_data <- tokens_clean %>%
+  count(tweet_id, cyberbullying_type, word, name = "n") %>%
+  tidytext::bind_tf_idf(
+    term = word,
+    document = tweet_id,
+    n = n
+  )
+
+head(tfidf_data)
+
+highest_tfidf <- tfidf_data %>%
+  arrange(desc(tf_idf)) %>%
+  select(
+    tweet_id,
+    cyberbullying_type,
+    word,
+    tf,
+    idf,
+    tf_idf
+  ) %>%
+  head(10)
+
+knitr::kable(highest_tfidf)
+
+summary(tfidf_data$tf)
+summary(tfidf_data$idf)
+summary(tfidf_data$tf_idf)
+
+6.2 Words with Highest Average TF-IDF
+
+Only words appearing in at least 50 distinct tweets are included.
+
+average_tfidf <- tfidf_data %>%
+  group_by(word) %>%
+  summarise(
+    average_tfidf = mean(tf_idf),
+    document_count = n_distinct(tweet_id),
+    .groups = "drop"
+  )
+
+common_tfidf_words <- average_tfidf %>%
+  filter(document_count >= 50) %>%
+  slice_max(
+    order_by = average_tfidf,
+    n = 20,
+    with_ties = FALSE
+  )
+
+knitr::kable(common_tfidf_words)
+
+ggplot(
+  common_tfidf_words,
+  aes(
+    x = reorder(word, average_tfidf),
+    y = average_tfidf
+  )
+) +
+  geom_col(fill = "darkcyan") +
+  coord_flip() +
+  labs(
+    title = "Top 20 Words by Average TF-IDF",
+    subtitle = "Words appearing in at least 50 distinct tweets",
+    x = "Word",
+    y = "Average TF-IDF"
+  ) +
+  theme_minimal()
+
+6.3 Category-Level TF-IDF
+
+Category-level TF-IDF highlights words that are relatively distinctive to a category.
+
+category_tfidf <- tokens_clean %>%
+  count(cyberbullying_type, word, name = "n") %>%
+  tidytext::bind_tf_idf(
+    term = word,
+    document = cyberbullying_type,
+    n = n
+  )
+
+word_tweet_counts <- tokens_clean %>%
+  distinct(tweet_id, word) %>%
+  count(word, name = "tweet_count")
+
+category_tfidf_filtered <- category_tfidf %>%
+  inner_join(word_tweet_counts, by = "word") %>%
+  filter(tweet_count >= 20)
+
+top_category_tfidf <- category_tfidf_filtered %>%
+  group_by(cyberbullying_type) %>%
+  slice_max(
+    order_by = tf_idf,
+    n = 10,
+    with_ties = FALSE
+  ) %>%
+  ungroup()
+
+knitr::kable(
+  top_category_tfidf %>%
+    select(cyberbullying_type, word, tf_idf, tweet_count)
+)
+
+ggplot(
+  top_category_tfidf,
+  aes(
+    x = tidytext::reorder_within(
+      word, tf_idf, cyberbullying_type
+    ),
+    y = tf_idf,
+    fill = cyberbullying_type
+  )
+) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ cyberbullying_type, scales = "free") +
+  tidytext::scale_x_reordered() +
+  coord_flip() +
+  labs(
+    title = "Distinctive Words Across Cyberbullying Categories",
+    subtitle = "Words appearing in at least 20 distinct tweets",
+    x = "Word",
+    y = "Category-Level TF-IDF"
+  ) +
+  theme_minimal()
+
+7. Prepare Training and Testing Data
+
+The data is split into 80% training and 20% testing. Stratified sampling aims to preserve the class distribution in both subsets.
+
+model_data <- clean_data %>%
+  select(tweet_clean, cyberbullying_type) %>%
+  filter(
+    !is.na(tweet_clean),
+    tweet_clean != "",
+    !is.na(cyberbullying_type)
+  ) %>%
+  mutate(
+    cyberbullying_type = factor(
+      cyberbullying_type,
+      levels = categories
+    )
+  )
+
+set.seed(123)
+
+train_index <- caret::createDataPartition(
+  model_data$cyberbullying_type,
+  p = 0.80,
+  list = FALSE
+)
+
+train_data <- model_data[train_index, , drop = FALSE]
+test_data <- model_data[-train_index, , drop = FALSE]
+
+cat("Training rows:", nrow(train_data), "\n")
+cat("Testing rows:", nrow(test_data), "\n")
+
+knitr::kable(
+  as.data.frame(table(train_data$cyberbullying_type)),
+  caption = "Training Category Distribution"
+)
+
+knitr::kable(
+  as.data.frame(table(test_data$cyberbullying_type)),
+  caption = "Testing Category Distribution"
+)
+
+8. Logistic Regression
+
+Multinomial Logistic Regression predicts one of the six categories. The text is represented using TF-IDF features.
+
+8.1 Build TF-IDF Matrices
+
+The vocabulary is created from training tweets only. The testing matrix uses the same vocabulary to prevent information leakage.
+
+corpus_train <- tm::VCorpus(
+  tm::VectorSource(train_data$tweet_clean)
+)
+
+dtm_train <- tm::DocumentTermMatrix(
+  corpus_train,
+  control = list(
+    wordLengths = c(3, Inf),
+    weighting = tm::weightTfIdf
+  )
+)
+
+dtm_train <- tm::removeSparseTerms(
+  dtm_train,
+  0.99
+)
+
+vocabulary <- tm::Terms(dtm_train)
+
+corpus_test <- tm::VCorpus(
+  tm::VectorSource(test_data$tweet_clean)
+)
+
+dtm_test <- tm::DocumentTermMatrix(
+  corpus_test,
+  control = list(
+    dictionary = vocabulary,
+    wordLengths = c(3, Inf),
+    weighting = tm::weightTfIdf
+  )
+)
+
+x_train <- as(dtm_train, "sparseMatrix")
+x_test <- as(dtm_test, "sparseMatrix")
+
+keep_train <- Matrix::rowSums(x_train) > 0
+keep_test <- Matrix::rowSums(x_test) > 0
+
+x_train <- x_train[keep_train, , drop = FALSE]
+x_test <- x_test[keep_test, , drop = FALSE]
+
+y_train <- droplevels(
+  train_data$cyberbullying_type[keep_train]
+)
+
+y_test <- factor(
+  test_data$cyberbullying_type[keep_test],
+  levels = levels(y_train)
+)
+
+if (length(y_train) == 0 || length(y_test) == 0) {
+  stop("No usable training or testing documents remain.")
+}
+
+if (ncol(x_train) == 0 || ncol(x_test) != ncol(x_train)) {
+  stop("Training and testing feature matrices are incompatible.")
+}
+
+if (length(unique(y_train)) < 2) {
+  stop("At least two classes are required for classification.")
+}
+
+cat("Training matrix:", dim(x_train), "\n")
+cat("Testing matrix:", dim(x_test), "\n")
+cat("Training labels:", length(y_train), "\n")
+cat("Testing labels:", length(y_test), "\n")
+
+8.2 Train Multinomial Logistic Regression
+
+The alpha = 0 setting uses ridge regularization. The value lambda = 0.01 specifies the regularization strength.
+
+set.seed(123)
+
+logistic_model <- glmnet::glmnet(
+  x = x_train,
+  y = y_train,
+  family = "multinomial",
+  alpha = 0,
+  lambda = 0.01
+)
+
+predictions <- predict(
+  logistic_model,
+  newx = x_test,
+  type = "class",
+  s = 0.01
+)
+
+predictions <- factor(
+  as.vector(predictions),
+  levels = levels(y_test)
+)
+
+original_results <- caret::confusionMatrix(
+  data = predictions,
+  reference = y_test
+)
+
+original_results
+
+8.3 Logistic Regression Metrics
+
+Accuracy measures the proportion of correct predictions. Cohen's Kappa measures agreement adjusted for agreement expected by chance.
+
+original_accuracy <- unname(
+  original_results$overall["Accuracy"]
+)
+
+original_kappa <- unname(
+  original_results$overall["Kappa"]
+)
+
+cat(
+  "Logistic Regression Accuracy:",
+  round(original_accuracy * 100, 2),
+  "%\n"
+)
+
+cat(
+  "Cohen's Kappa:",
+  round(original_kappa, 4),
+  "\n"
+)
+
+original_class_metrics <- as.data.frame(
+  original_results$byClass
+)
+
+knitr::kable(original_class_metrics, digits = 3)
+
+8.4 Logistic Regression Confusion Matrix
+
+Rows represent actual classes, and columns represent predicted classes in the confusion matrix table. Correct predictions lie on the diagonal.
+
+cm_logistic <- as.data.frame(
+  table(
+    Actual = y_test,
+    Predicted = predictions
+  )
+)
+
+ggplot(
+  cm_logistic,
+  aes(x = Actual, y = Predicted, fill = Freq)
+) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 3) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(
+    title = "Confusion Matrix: Logistic Regression",
+    x = "Actual Category",
+    y = "Predicted Category",
+    fill = "Count"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 35, hjust = 1)
+  )
+
+8.5 Tune Logistic Regression Using Cross-Validation
+
+Five-fold cross-validation selects a regularization parameter using training data. The test set is not used to select the parameter.
+
+set.seed(123)
+
+cv_model <- glmnet::cv.glmnet(
+  x = x_train,
+  y = y_train,
+  family = "multinomial",
+  alpha = 0,
+  type.measure = "class",
+  nfolds = 5
+)
+
+cat("Lambda minimum:", cv_model$lambda.min, "\n")
+cat("Lambda one standard error:", cv_model$lambda.1se, "\n")
+
+plot(cv_model)
+
+8.6 Evaluate the Tuned Logistic Regression
+tuned_predictions <- predict(
+  cv_model,
+  newx = x_test,
+  s = "lambda.min",
+  type = "class"
+)
+
+tuned_predictions <- factor(
+  as.vector(tuned_predictions),
+  levels = levels(y_test)
+)
+
+tuned_results <- caret::confusionMatrix(
+  data = tuned_predictions,
+  reference = y_test
+)
+
+tuned_results
+
+tuned_accuracy <- unname(
+  tuned_results$overall["Accuracy"]
+)
+
+tuned_kappa <- unname(
+  tuned_results$overall["Kappa"]
+)
+
+cat(
+  "Tuned Logistic Regression Accuracy:",
+  round(tuned_accuracy * 100, 2),
+  "%\n"
+)
+
+cat(
+  "Tuned Logistic Regression Kappa:",
+  round(tuned_kappa, 4),
+  "\n"
+)
+
+9. Support Vector Machine (SVM)
+
+The SVM classifier uses unigram and bigram TF-IDF features. Unigrams are single words, while bigrams are two consecutive words.
+
+9.1 Create Unigram and Bigram Features
+
+The vocabulary and TF-IDF weights are learned from training tweets, then applied to the test tweets.
+
+it_train <- text2vec::itoken(
+  train_data$tweet_clean,
+  tokenizer = text2vec::word_tokenizer,
+  progressbar = FALSE
+)
+
+vocab_svm <- text2vec::create_vocabulary(
+  it_train,
+  ngram = c(1L, 2L)
+)
+
+vocab_svm <- text2vec::prune_vocabulary(
+  vocab_svm,
+  term_count_min = 5,
+  doc_proportion_max = 0.5
+)
+
+vectorizer <- text2vec::vocab_vectorizer(vocab_svm)
+
+dtm_train2 <- text2vec::create_dtm(
+  it_train,
+  vectorizer
+)
+
+it_test <- text2vec::itoken(
+  test_data$tweet_clean,
+  tokenizer = text2vec::word_tokenizer,
+  progressbar = FALSE
+)
+
+dtm_test2 <- text2vec::create_dtm(
+  it_test,
+  vectorizer
+)
+
+tfidf_transformer <- text2vec::TfIdf$new()
+
+x_train2 <- text2vec::fit_transform(
+  dtm_train2,
+  tfidf_transformer
+)
+
+x_test2 <- text2vec::transform(
+  dtm_test2,
+  tfidf_transformer
+)
+
+keep_train2 <- Matrix::rowSums(x_train2) > 0
+keep_test2 <- Matrix::rowSums(x_test2) > 0
+
+x_train2 <- x_train2[keep_train2, , drop = FALSE]
+x_test2 <- x_test2[keep_test2, , drop = FALSE]
+
+y_train2 <- droplevels(
+  train_data$cyberbullying_type[keep_train2]
+)
+
+y_test2 <- factor(
+  test_data$cyberbullying_type[keep_test2],
+  levels = levels(y_train2)
+)
+
+if (length(y_train2) == 0 || length(y_test2) == 0) {
+  stop("No usable SVM training or testing documents remain.")
+}
+
+if (ncol(x_train2) == 0 || ncol(x_test2) != ncol(x_train2)) {
+  stop("SVM training and testing feature matrices are incompatible.")
+}
+
+cat("SVM training matrix:", dim(x_train2), "\n")
+cat("SVM testing matrix:", dim(x_test2), "\n")
+
+9.2 Tune the SVM Regularization Parameter
+
+The cost parameter controls the penalty for classification errors. A validation subset is used to select the cost value. The test set remains untouched during tuning.
+
+set.seed(123)
+
+sub_index <- as.vector(
+  caret::createDataPartition(
+    y_train2,
+    p = 0.85,
+    list = FALSE
+  )
+)
+
+x_subtrain <- x_train2[sub_index, , drop = FALSE]
+x_valid <- x_train2[-sub_index, , drop = FALSE]
+
+y_subtrain <- droplevels(y_train2[sub_index])
+
+y_valid <- factor(
+  y_train2[-sub_index],
+  levels = levels(y_subtrain)
+)
+
+if (nrow(x_valid) == 0 || length(y_subtrain) == 0) {
+  stop("The SVM training-validation split is empty.")
+}
+
+cat("Subtraining rows:", nrow(x_subtrain), "\n")
+cat("Validation rows:", nrow(x_valid), "\n")
+
+cost_values <- c(0.01, 0.1, 1, 10)
+
+validation_results <- lapply(
+  cost_values,
+  function(c_value) {
+
+    svm_candidate <- LiblineaR::LiblineaR(
+      data = x_subtrain,
+      target = y_subtrain,
+      type = 1,
+      cost = c_value,
+      bias = TRUE,
+      verbose = FALSE
+    )
+
+    valid_predictions <- predict(
+      svm_candidate,
+      x_valid
+    )$predictions
+
+    valid_predictions <- factor(
+      valid_predictions,
+      levels = levels(y_valid)
+    )
+
+    cm <- caret::confusionMatrix(
+      data = valid_predictions,
+      reference = y_valid
+    )
+
+    data.frame(
+      Cost = c_value,
+      ValidationAccuracy = unname(
+        cm$overall["Accuracy"]
+      ),
+      Kappa = unname(
+        cm$overall["Kappa"]
+      )
+    )
+  }
+)
+
+validation_results <- do.call(
+  rbind,
+  validation_results
+)
+
+knitr::kable(validation_results, digits = 4)
+
+best_cost <- validation_results$Cost[
+  which.max(validation_results$ValidationAccuracy)
+]
+
+cat("Selected SVM cost:", best_cost, "\n")
+
+9.3 Train the Final SVM Model
+
+The final SVM is trained using the full SVM training set and the cost selected through validation.
+
+set.seed(123)
+
+final_svm_model <- LiblineaR::LiblineaR(
+  data = x_train2,
+  target = y_train2,
+  type = 1,
+  cost = best_cost,
+  bias = TRUE,
+  verbose = FALSE
+)
+
+cat("Final SVM model trained successfully.\n")
+
+9.4 Predict and Evaluate SVM
+final_predictions <- predict(
+  final_svm_model,
+  x_test2
+)$predictions
+
+final_predictions <- factor(
+  final_predictions,
+  levels = levels(y_test2)
+)
+
+final_results <- caret::confusionMatrix(
+  data = final_predictions,
+  reference = y_test2
+)
+
+final_results
+
+9.5 Overall SVM Metrics
+svm_accuracy <- unname(
+  final_results$overall["Accuracy"]
+)
+
+svm_kappa <- unname(
+  final_results$overall["Kappa"]
+)
+
+cat(
+  "SVM Test Accuracy:",
+  round(svm_accuracy * 100, 2),
+  "%\n"
+)
+
+cat(
+  "SVM Cohen's Kappa:",
+  round(svm_kappa, 4),
+  "\n"
+)
+
+svm_class_metrics <- as.data.frame(
+  final_results$byClass
+)
+
+knitr::kable(svm_class_metrics, digits = 3)
+
+9.6 SVM Confusion Matrix
+cm_svm <- as.data.frame(
+  table(
+    Actual = y_test2,
+    Predicted = final_predictions
+  )
+)
+
+ggplot(
+  cm_svm,
+  aes(x = Actual, y = Predicted, fill = Freq)
+) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 3) +
+  scale_fill_gradient(low = "white", high = "darkcyan") +
+  labs(
+    title = "Confusion Matrix: SVM",
+    x = "Actual Category",
+    y = "Predicted Category",
+    fill = "Count"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 35, hjust = 1)
+  )
+
+10. Compare Classification Models
+
+The following comparison uses each model's measured test accuracy and Cohen's Kappa. The Logistic Regression and SVM pipelines can remove different numbers of empty documents, so their test subsets may differ slightly.
+
+10.1 Accuracy and Kappa Comparison
+model_comparison <- data.frame(
+  Model = c(
+    "Logistic Regression",
+    "Tuned Logistic Regression",
+    "SVM"
+  ),
+  Accuracy = c(
+    original_accuracy,
+    tuned_accuracy,
+    svm_accuracy
+  ),
+  Kappa = c(
+    original_kappa,
+    tuned_kappa,
+    svm_kappa
+  )
+)
+
+comparison_display <- model_comparison %>%
+  mutate(
+    Accuracy_Percent = round(Accuracy * 100, 2),
+    Kappa = round(Kappa, 4)
+  ) %>%
+  select(Model, Accuracy_Percent, Kappa)
+
+knitr::kable(
+  comparison_display,
+  caption = "Classification Model Performance"
+)
+
+ggplot(
+  model_comparison,
+  aes(
+    x = Model,
+    y = Accuracy * 100,
+    fill = Model
+  )
+) +
+  geom_col(width = 0.65, show.legend = FALSE) +
+  geom_text(
+    aes(label = sprintf("%.2f%%", Accuracy * 100)),
+    vjust = -0.5,
+    size = 4
+  ) +
+  coord_cartesian(ylim = c(0, 100)) +
+  labs(
+    title = "Accuracy Comparison of Classification Models",
+    x = "Model",
+    y = "Test Accuracy (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 15, hjust = 1)
+  )
+
+10.2 Class-Wise Precision, Recall, and F1-Score
+
+Precision measures how many predictions for a category were correct. Recall measures how many actual tweets in that category were identified. F1-score combines precision and recall.
+
+extract_metrics <- function(cm, model_name) {
+
+  result <- as.data.frame(cm$byClass)
+
+  result$Class <- rownames(result)
+
+  precision <- result[["Pos Pred Value"]]
+  recall <- result[["Sensitivity"]]
+
+  if ("F1" %in% names(result)) {
+    f1 <- result[["F1"]]
+  } else {
+    f1 <- ifelse(
+      precision + recall > 0,
+      2 * precision * recall / (precision + recall),
+      0
+    )
+  }
+
+  result %>%
+    transmute(
+      Class = sub("^Class: ", "", Class),
+      Precision = precision,
+      Recall = recall,
+      F1_Score = f1,
+      Model = model_name
+    )
+}
+
+metrics_comparison <- dplyr::bind_rows(
+  extract_metrics(
+    original_results,
+    "Logistic Regression"
+  ),
+  extract_metrics(
+    tuned_results,
+    "Tuned Logistic Regression"
+  ),
+  extract_metrics(
+    final_results,
+    "SVM"
+  )
+)
+
+knitr::kable(
+  metrics_comparison,
+  digits = 3,
+  caption = "Class-Wise Classification Metrics"
+)
+
+metrics_long <- metrics_comparison %>%
+  pivot_longer(
+    cols = c(Precision, Recall, F1_Score),
+    names_to = "Metric",
+    values_to = "Score"
+  )
+
+ggplot(
+  metrics_long,
+  aes(
+    x = Class,
+    y = Score * 100,
+    fill = Metric
+  )
+) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ Model) +
+  coord_cartesian(ylim = c(0, 100)) +
+  labs(
+    title = "Class-Wise Classification Performance",
+    x = "Cyberbullying Category",
+    y = "Score (%)",
+    fill = "Metric"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 35, hjust = 1)
+  )
+
+11. Save Project Results
+
+The output directory is created in the current working directory. The following files contain the final SVM model, its predictions, evaluation metrics, the model comparison, and the cleaned dataset.
+
+output_dir <- "Cyberbullying_Results"
+
+if (!dir.exists(output_dir)) {
+  dir.create(
+    output_dir,
+    recursive = TRUE
+  )
+}
+
+# Save the trained SVM model
+saveRDS(
+  final_svm_model,
+  file.path(output_dir, "final_svm_model.rds")
+)
+
+# Save test predictions and actual labels
+prediction_results <- data.frame(
+  Actual = as.character(y_test2),
+  Predicted = as.character(final_predictions)
+)
+
+write.csv(
+  prediction_results,
+  file.path(output_dir, "svm_test_predictions.csv"),
+  row.names = FALSE
+)
+
+# Save the SVM confusion matrix
+write.csv(
+  as.matrix(final_results$table),
+  file.path(output_dir, "svm_confusion_matrix.csv")
+)
+
+# Save overall SVM metrics
+overall_metrics <- data.frame(
+  Metric = names(final_results$overall),
+  Value = as.numeric(final_results$overall)
+)
+
+write.csv(
+  overall_metrics,
+  file.path(output_dir, "svm_overall_metrics.csv"),
+  row.names = FALSE
+)
+
+# Save class-wise SVM metrics
+class_metrics_export <- as.data.frame(
+  final_results$byClass
+)
+
+class_metrics_export$Class <- rownames(
+  class_metrics_export
+)
+
+write.csv(
+  class_metrics_export,
+  file.path(output_dir, "svm_class_metrics.csv"),
+  row.names = FALSE
+)
+
+# Save the model comparison
+write.csv(
+  model_comparison,
+  file.path(output_dir, "model_comparison.csv"),
+  row.names = FALSE
+)
+
+# Save the cleaned dataset
+write.csv(
+  clean_data,
+  file.path(output_dir, "cleaned_cyberbullying_tweets.csv"),
+  row.names = FALSE
+)
+
+cat("Saved files:\n")
+
+print(list.files(output_dir))
+
+cat("\nOutput directory:\n")
+print(normalizePath(output_dir, winslash = "/", mustWork = FALSE))
+
+12. Conclusion
+
+This project demonstrates a complete text-classification workflow for cyberbullying tweets. The dataset was cleaned and explored using word-frequency analysis and TF-IDF. Multinomial Logistic Regression and a Support Vector Machine were trained to classify tweets into six categories.
+
+Model performance was assessed using accuracy, Cohen's Kappa, confusion matrices, precision, recall, and F1-score. The comparison table and plots show the measured performance of each model.
+
+The model with the highest test accuracy can be identified from the generated comparison table. Class-wise metrics help reveal categories that are more difficult to classify.
+
+All conclusions should be based on the values generated when the R Markdown document is knitted. The final SVM model and its evaluation results are saved in the Cyberbullying_Results directory for future use.
